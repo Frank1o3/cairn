@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Cairn
+Comment=Developer-friendly Linux file manager
+Exec=cairn
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileTools;FileManager;
+StartupNotify=true
