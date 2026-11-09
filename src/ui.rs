@@ -39,6 +39,8 @@ struct AppState {
     preferences: settings::Preferences,
     clipboard: Vec<gio::File>,
     clipboard_is_cut: bool,
+    undo_stack: Vec<operations::UndoAction>,
+    redo_stack: Vec<operations::UndoAction>,
 }
 
 impl Default for AppState {
@@ -67,6 +69,8 @@ impl Default for AppState {
             preferences: settings::Preferences::default(),
             clipboard: Vec::new(),
             clipboard_is_cut: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -98,17 +102,25 @@ fn build_ui(app: &Application) {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"));
+    let preferences = settings::Preferences::load();
+    let window_width = preferences.window_width;
+    let window_height = preferences.window_height;
+    let sidebar_width = preferences.sidebar_width;
+    let window_maximized = preferences.window_maximized;
+    if let Some(gtk_settings) = gtk::Settings::default() {
+        gtk_settings.set_gtk_application_prefer_dark_theme(preferences.prefer_dark);
+    }
     let state = Rc::new(RefCell::new(AppState {
         current: gio::File::for_path(home.clone()),
-        preferences: settings::Preferences::load(),
+        preferences,
         ..Default::default()
     }));
 
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Cairn")
-        .default_width(1280)
-        .default_height(820)
+        .default_width(window_width)
+        .default_height(window_height)
         .build();
     // GTK's natural minimum for the individual controls is too small to make
     // a useful floating file-manager window. Keep a practical floor while
@@ -120,8 +132,7 @@ fn build_ui(app: &Application) {
     let forward = tool_button("go-next-symbolic", "Forward");
     let up = tool_button("go-up-symbolic", "Parent folder");
     let refresh = tool_button("view-refresh-symbolic", "Refresh");
-    let terminal = Button::with_label("Open in Terminal");
-    terminal.set_icon_name("utilities-terminal-symbolic");
+    let terminal = menu_action_button("utilities-terminal-symbolic", "Open in Terminal");
     terminal.add_css_class("suggested-action");
 
     let location = Entry::new();
@@ -147,13 +158,19 @@ fn build_ui(app: &Application) {
     header.pack_end(&refresh);
 
     let root = GtkBox::new(Orientation::Vertical, 0);
+    root.add_css_class("app-shell");
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
 
     let pane = Paned::new(Orientation::Horizontal);
+    pane.add_css_class("workspace-pane");
     pane.set_hexpand(true);
     pane.set_vexpand(true);
     pane.set_shrink_start_child(true);
     pane.set_shrink_end_child(true);
-    pane.set_position(225);
+    pane.set_position(sidebar_width);
 
     let sidebar = GtkBox::new(Orientation::Vertical, 8);
     sidebar.set_margin_top(14);
@@ -203,9 +220,24 @@ fn build_ui(app: &Application) {
         "File system",
         gio::File::for_path("/"),
     ));
+    shortcuts.push((
+        "user-trash-symbolic",
+        "Trash",
+        gio::File::for_uri("trash:///"),
+    ));
+    shortcuts.push((
+        "network-workgroup-symbolic",
+        "Network",
+        gio::File::for_uri("network:///"),
+    ));
     for (icon, title, file) in shortcuts {
         let row = place_row(icon, title);
         places.append(&row);
+        if title == "Trash" {
+            connect_trash_place_menu(&row, &window, &state);
+        } else {
+            connect_place_context_menu(&row, file.clone(), &state);
+        }
         let state = state.clone();
         row.connect_clicked(move |_| navigate_to(&state, file.clone(), true));
     }
@@ -250,9 +282,17 @@ fn build_ui(app: &Application) {
         gtk::EntryIconPosition::Primary,
         Some("system-search-symbolic"),
     );
+    search.set_icon_from_icon_name(
+        gtk::EntryIconPosition::Secondary,
+        Some("edit-clear-symbolic"),
+    );
+    search.connect_icon_press(|entry, position| {
+        if position == gtk::EntryIconPosition::Secondary {
+            entry.set_text("");
+        }
+    });
     search.set_width_chars(14);
-    let new_folder = Button::with_label("New Folder");
-    new_folder.set_icon_name("folder-new-symbolic");
+    let new_folder = menu_action_button("folder-new-symbolic", "New Folder");
     new_folder.add_css_class("flat");
     let bookmark_button = tool_button("bookmark-new-symbolic", "Bookmark this location");
     let actions_button = MenuButton::new();
@@ -264,9 +304,13 @@ fn build_ui(app: &Application) {
     action_list.set_margin_start(6);
     action_list.set_margin_end(6);
     for (label, icon, action) in [
+        ("Undo", "edit-undo-symbolic", FileAction::Undo),
+        ("Redo", "edit-redo-symbolic", FileAction::Redo),
         ("Open", "document-open-symbolic", FileAction::Open),
         ("New Tab", "tab-new-symbolic", FileAction::NewTab),
         ("Close Tab", "window-close-symbolic", FileAction::CloseTab),
+        ("Connect to Server…", "network-server-symbolic", FileAction::ConnectToServer),
+        ("New Folder…", "folder-new-symbolic", FileAction::NewFolder),
         (
             "New Empty File…",
             "document-new-symbolic",
@@ -275,6 +319,7 @@ fn build_ui(app: &Application) {
         ("Copy", "edit-copy-symbolic", FileAction::Copy),
         ("Cut", "edit-cut-symbolic", FileAction::Cut),
         ("Paste", "edit-paste-symbolic", FileAction::Paste),
+        ("Duplicate", "edit-copy-symbolic", FileAction::Duplicate),
         (
             "Select by Pattern…",
             "edit-find-symbolic",
@@ -292,14 +337,14 @@ fn build_ui(app: &Application) {
             "edit-delete-symbolic",
             FileAction::Delete,
         ),
+        ("Empty Trash…", "user-trash-symbolic", FileAction::EmptyTrash),
         (
             "Properties",
             "dialog-information-symbolic",
             FileAction::Properties,
         ),
     ] {
-        let button = Button::with_label(label);
-        button.set_icon_name(icon);
+        let button = menu_action_button(icon, label);
         button.add_css_class("flat");
         let state = state.clone();
         let parent = window.clone();
@@ -325,6 +370,14 @@ fn build_ui(app: &Application) {
     let settings_heading = Label::new(Some("FILE VIEW"));
     settings_heading.set_xalign(0.0);
     settings_heading.add_css_class("section-label");
+    let appearance_label = Label::new(Some("Appearance"));
+    appearance_label.set_xalign(0.0);
+    let appearance = DropDown::from_strings(&["System", "Dark"]);
+    appearance.set_selected(if state.borrow().preferences.prefer_dark { 1 } else { 0 });
+    let density_label = Label::new(Some("List density"));
+    density_label.set_xalign(0.0);
+    let density = DropDown::from_strings(&["Comfortable", "Compact"]);
+    density.set_selected(if state.borrow().preferences.compact_view { 1 } else { 0 });
     let show_hidden = CheckButton::with_label("Show hidden files");
     show_hidden.set_active(state.borrow().preferences.show_hidden);
     let directories_first = CheckButton::with_label("Folders first");
@@ -333,21 +386,32 @@ fn build_ui(app: &Application) {
     confirm_trash.set_active(state.borrow().preferences.confirm_trash);
     let single_click = CheckButton::with_label("Open items with one click");
     single_click.set_active(state.borrow().preferences.open_on_single_click);
+    let show_thumbnails = CheckButton::with_label("Show image thumbnails");
+    show_thumbnails.set_active(state.borrow().preferences.show_thumbnails);
     let sort_label = Label::new(Some("Sort by"));
     sort_label.set_xalign(0.0);
-    let sort_by = DropDown::from_strings(&["Name", "File size", "Date modified"]);
+    let sort_by = DropDown::from_strings(&["Name", "File size", "Date modified", "File type"]);
     sort_by.set_selected(match state.borrow().preferences.sort_by {
         settings::SortBy::Name => 0,
         settings::SortBy::Size => 1,
         settings::SortBy::Modified => 2,
+        settings::SortBy::Type => 3,
     });
+    let sort_reversed = CheckButton::with_label("Reverse sort order (descending)");
+    sort_reversed.set_active(state.borrow().preferences.sort_reversed);
     settings_box.append(&settings_heading);
+    settings_box.append(&appearance_label);
+    settings_box.append(&appearance);
+    settings_box.append(&density_label);
+    settings_box.append(&density);
     settings_box.append(&show_hidden);
     settings_box.append(&directories_first);
     settings_box.append(&confirm_trash);
     settings_box.append(&single_click);
+    settings_box.append(&show_thumbnails);
     settings_box.append(&sort_label);
     settings_box.append(&sort_by);
+    settings_box.append(&sort_reversed);
     settings_popover.set_child(Some(&settings_box));
     settings_button.set_popover(Some(&settings_popover));
     toolbar.append(&location);
@@ -363,6 +427,7 @@ fn build_ui(app: &Application) {
     rows.set_selection_mode(gtk::SelectionMode::Multiple);
     rows.add_css_class("file-list");
     rows.set_activate_on_single_click(false);
+    rows.set_vexpand(true);
     let scroll = ScrolledWindow::new();
     scroll.set_hexpand(true);
     scroll.set_vexpand(true);
@@ -414,6 +479,7 @@ fn build_ui(app: &Application) {
     refresh_devices(&state, &window);
     refresh_bookmarks(&state);
     connect_file_rows(&rows, &state);
+    connect_background_context_menu(&rows, &state);
     {
         let state = state.clone();
         notebook.connect_switch_page(move |notebook, _, page| {
@@ -516,12 +582,40 @@ fn build_ui(app: &Application) {
         save_preferences(&st);
     });
     let st = state.clone();
+    show_thumbnails.connect_toggled(move |check| {
+        st.borrow_mut().preferences.show_thumbnails = check.is_active();
+        save_preferences(&st);
+        render(&st);
+    });
+    let st = state.clone();
+    appearance.connect_selected_notify(move |dropdown| {
+        let prefer_dark = dropdown.selected() == 1;
+        st.borrow_mut().preferences.prefer_dark = prefer_dark;
+        if let Some(gtk_settings) = gtk::Settings::default() {
+            gtk_settings.set_gtk_application_prefer_dark_theme(prefer_dark);
+        }
+        save_preferences(&st);
+    });
+    let st = state.clone();
+    density.connect_selected_notify(move |dropdown| {
+        st.borrow_mut().preferences.compact_view = dropdown.selected() == 1;
+        save_preferences(&st);
+        render(&st);
+    });
+    let st = state.clone();
     sort_by.connect_selected_notify(move |dropdown| {
         st.borrow_mut().preferences.sort_by = match dropdown.selected() {
             1 => settings::SortBy::Size,
             2 => settings::SortBy::Modified,
+            3 => settings::SortBy::Type,
             _ => settings::SortBy::Name,
         };
+        save_preferences(&st);
+        render(&st);
+    });
+    let st = state.clone();
+    sort_reversed.connect_toggled(move |check| {
+        st.borrow_mut().preferences.sort_reversed = check.is_active();
         save_preferences(&st);
         render(&st);
     });
@@ -549,6 +643,24 @@ fn build_ui(app: &Application) {
     window.add_controller(shortcuts_controller(&state, &window));
     render(&state);
     window.present();
+    if window_maximized {
+        window.maximize();
+    }
+
+    let state_close = state.clone();
+    let pane_close = pane.clone();
+    window.connect_close_request(move |window| {
+        let mut state = state_close.borrow_mut();
+        if !window.is_maximized() {
+            state.preferences.window_width = window.width().max(820);
+            state.preferences.window_height = window.height().max(560);
+        }
+        state.preferences.sidebar_width = pane_close.position().clamp(168, 800);
+        state.preferences.window_maximized = window.is_maximized();
+        drop(state);
+        save_preferences(&state_close);
+        glib::Propagation::Proceed
+    });
 }
 
 fn shortcuts_controller(
@@ -561,6 +673,39 @@ fn shortcuts_controller(
     controller.connect_key_pressed(move |_, key, _, modifiers| {
         let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+        let alt = modifiers.contains(gdk::ModifierType::ALT_MASK);
+
+        if alt && key == gdk::Key::Up {
+            let parent_dir = state.borrow().current.parent();
+            if let Some(parent_dir) = parent_dir {
+                navigate_to(&state, parent_dir, true);
+            }
+            return glib::Propagation::Stop;
+        }
+        if alt && key == gdk::Key::Left {
+            go_back(&state);
+            return glib::Propagation::Stop;
+        }
+        if alt && key == gdk::Key::Right {
+            go_forward(&state);
+            return glib::Propagation::Stop;
+        }
+        if control && !shift && key == gdk::Key::z {
+            perform_file_action(FileAction::Undo, &parent, &state);
+            return glib::Propagation::Stop;
+        }
+        if (control && shift && key == gdk::Key::z) || (control && key == gdk::Key::y) {
+            perform_file_action(FileAction::Redo, &parent, &state);
+            return glib::Propagation::Stop;
+        }
+        if control && key == gdk::Key::d {
+            perform_file_action(FileAction::Duplicate, &parent, &state);
+            return glib::Propagation::Stop;
+        }
+        if control && !shift && key == gdk::Key::n {
+            perform_file_action(FileAction::NewFile, &parent, &state);
+            return glib::Propagation::Stop;
+        }
         if control && key == gdk::Key::t {
             new_tab(&parent, &state);
             return glib::Propagation::Stop;
@@ -657,13 +802,37 @@ fn shortcuts_controller(
             );
             return glib::Propagation::Stop;
         }
-        if key == gdk::Key::F5 {
+        if key == gdk::Key::F5 || (control && key == gdk::Key::r) {
             render(&state);
             return glib::Propagation::Stop;
         }
         if key == gdk::Key::BackSpace {
             go_back(&state);
             return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::Escape {
+            if let Some(search) = &state.borrow().search_entry {
+                if !search.text().is_empty() {
+                    search.set_text("");
+                    return glib::Propagation::Stop;
+                }
+            }
+            if let Some(rows) = &state.borrow().rows {
+                rows.unselect_all();
+            }
+            return glib::Propagation::Stop;
+        }
+        if (key == gdk::Key::Return || key == gdk::Key::KP_Enter) && !control && !alt && !shift {
+            let path_focused = state
+                .borrow()
+                .path_entry
+                .as_ref()
+                .map(|e| e.has_focus())
+                .unwrap_or(false);
+            if !path_focused {
+                perform_file_action(FileAction::Open, &parent, &state);
+                return glib::Propagation::Stop;
+            }
         }
         glib::Propagation::Proceed
     });
@@ -674,12 +843,21 @@ fn shortcuts_controller(
 enum FileAction {
     Open,
     OpenInNewTab,
+    OpenWithEditor,
     NewTab,
     CloseTab,
+    ConnectToServer,
+    NewFolder,
     NewFile,
     Copy,
     Cut,
     Paste,
+    Duplicate,
+    ExtractHere,
+    ExtractTo,
+    CompressZip,
+    CompressTarGz,
+    SelectAll,
     SelectByPattern,
     InvertSelection,
     CopyLocation,
@@ -687,6 +865,10 @@ enum FileAction {
     Rename,
     Trash,
     Delete,
+    EmptyTrash,
+    RestoreFromTrash,
+    Undo,
+    Redo,
     Properties,
 }
 
@@ -716,8 +898,20 @@ fn perform_file_action(
                 }
             }
         }
+        FileAction::OpenWithEditor => {
+            let selected = selected_files(state);
+            for item in selected {
+                if !item.is_dir {
+                    if let Err(error) = filesystem::open_with_text_editor(&item.file) {
+                        set_status(state, &format!("Could not open with editor: {error}"));
+                    }
+                }
+            }
+        }
+        FileAction::NewFolder => create_folder_dialog(parent, state),
         FileAction::NewFile => create_file_dialog(parent, state),
         FileAction::NewTab => new_tab(parent, state),
+        FileAction::ConnectToServer => connect_to_server_dialog(parent, state),
         FileAction::OpenInNewTab => {
             if let Some(item) = selected_files(state).first() {
                 let target = item.file.clone();
@@ -759,6 +953,123 @@ fn perform_file_action(
             );
         }
         FileAction::Paste => paste_items(state),
+        FileAction::Duplicate => {
+            let selected = selected_files(state);
+            if selected.is_empty() {
+                set_status(state, "Select one or more files to duplicate.");
+                return;
+            }
+            let state = state.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let count = selected.len();
+                let mut success = 0;
+                for item in selected {
+                    if let Ok(copy_file) = operations::duplicate(&item.file).await {
+                        success += 1;
+                        let mut s = state.borrow_mut();
+                        s.redo_stack.clear();
+                        s.undo_stack.push(operations::UndoAction::Duplicate { copy_file });
+                    }
+                }
+                render(&state);
+                set_status(&state, &format!("Duplicated {success} of {count} item(s)"));
+            });
+        }
+        FileAction::ExtractHere => {
+            let selected = selected_files(state);
+            let target_folder = state.borrow().current.clone();
+            let state = state.clone();
+            glib::MainContext::default().spawn_local(async move {
+                for item in selected {
+                    set_status(&state, "Extracting archive…");
+                    match operations::extract_archive(&item.file, &target_folder) {
+                        Ok(()) => {
+                            render(&state);
+                            set_status(&state, "Extracted archive successfully.");
+                        }
+                        Err(err) => {
+                            set_status(&state, &format!("Extraction failed: {err}"));
+                        }
+                    }
+                }
+            });
+        }
+        FileAction::ExtractTo => {
+            let selected = selected_files(state);
+            let current_dir = state.borrow().current.clone();
+            let state = state.clone();
+            glib::MainContext::default().spawn_local(async move {
+                for item in selected {
+                    let basename = item
+                        .file
+                        .basename()
+                        .map(|b| b.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "extracted".to_string());
+                    let stem = if let Some(stripped) = basename
+                        .strip_suffix(".tar.gz")
+                        .or_else(|| basename.strip_suffix(".tar.xz"))
+                        .or_else(|| basename.strip_suffix(".tar.bz2"))
+                        .or_else(|| basename.strip_suffix(".tar.zst"))
+                        .or_else(|| basename.strip_suffix(".tgz"))
+                        .or_else(|| basename.strip_suffix(".txz"))
+                    {
+                        stripped
+                    } else if let Some(dot) = basename.rfind('.') {
+                        &basename[..dot]
+                    } else {
+                        &basename
+                    };
+                    let dest_folder = current_dir.child(stem);
+                    let _ = dest_folder.make_directory_future(glib::Priority::DEFAULT).await;
+                    set_status(&state, "Extracting archive…");
+                    match operations::extract_archive(&item.file, &dest_folder) {
+                        Ok(()) => {
+                            render(&state);
+                            set_status(&state, &format!("Extracted to {stem}/"));
+                        }
+                        Err(err) => {
+                            set_status(&state, &format!("Extraction failed: {err}"));
+                        }
+                    }
+                }
+            });
+        }
+        FileAction::CompressZip | FileAction::CompressTarGz => {
+            let selected = selected_files(state);
+            if selected.is_empty() {
+                set_status(state, "Select files or folders to compress.");
+                return;
+            }
+            let format = if matches!(action, FileAction::CompressZip) {
+                "zip"
+            } else {
+                "tar.gz"
+            };
+            let parent_dir = state.borrow().current.clone();
+            let sources: Vec<gio::File> = selected.into_iter().map(|item| item.file).collect();
+            let state = state.clone();
+            set_status(&state, "Creating archive…");
+            glib::MainContext::default().spawn_local(async move {
+                match operations::compress_to_archive(&sources, &parent_dir, format) {
+                    Ok(arch) => {
+                        render(&state);
+                        let name = arch
+                            .basename()
+                            .map(|b| b.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        set_status(&state, &format!("Created archive: {name}"));
+                    }
+                    Err(err) => {
+                        set_status(&state, &format!("Failed to create archive: {err}"));
+                    }
+                }
+            });
+        }
+        FileAction::SelectAll => {
+            if let Some(rows) = &state.borrow().rows {
+                rows.select_all();
+            }
+        }
         FileAction::SelectByPattern => select_by_pattern_dialog(parent, state),
         FileAction::InvertSelection => invert_selection(state),
         FileAction::CopyLocation => {
@@ -780,18 +1091,106 @@ fn perform_file_action(
             }
         }
         FileAction::OpenTerminalHere => {
-            if let Some(item) = selected_files(state).first() {
-                if let Some(path) = item.file.path() {
-                    let status = state.borrow().status_label.clone();
-                    terminal::open_terminal(&path, status.as_ref());
+            let selected = selected_files(state);
+            let target = if let Some(item) = selected.first() {
+                if item.is_dir {
+                    item.file.clone()
                 } else {
-                    set_status(state, "A local shell cannot start in a remote location.");
+                    state.borrow().current.clone()
                 }
+            } else {
+                state.borrow().current.clone()
+            };
+            if let Some(path) = target.path() {
+                let status = state.borrow().status_label.clone();
+                terminal::open_terminal(&path, status.as_ref());
+            } else {
+                set_status(state, "A local shell cannot start in a remote location.");
             }
         }
         FileAction::Rename => rename_selected(parent, state),
         FileAction::Trash => trash_selected(parent, state, false),
         FileAction::Delete => trash_selected(parent, state, true),
+        FileAction::EmptyTrash => {
+            let dialog = gtk::MessageDialog::builder()
+                .transient_for(parent)
+                .modal(true)
+                .message_type(gtk::MessageType::Question)
+                .buttons(gtk::ButtonsType::OkCancel)
+                .text("Empty Trash?")
+                .secondary_text("All items in the Trash will be permanently deleted.")
+                .build();
+            let state = state.clone();
+            dialog.connect_response(move |dialog, response| {
+                if response == gtk::ResponseType::Ok {
+                    let state = state.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if let Err(err) = operations::empty_trash().await {
+                            set_status(&state, &format!("Could not empty trash: {err}"));
+                        } else {
+                            render(&state);
+                            set_status(&state, "Trash emptied.");
+                        }
+                    });
+                }
+                dialog.close();
+            });
+            dialog.present();
+        }
+        FileAction::RestoreFromTrash => {
+            let selected = selected_files(state);
+            let state = state.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let mut count = 0;
+                for item in selected {
+                    if operations::restore_from_trash(&item.file).await.is_ok() {
+                        count += 1;
+                    }
+                }
+                render(&state);
+                set_status(&state, &format!("Restored {count} item(s) from Trash"));
+            });
+        }
+        FileAction::Undo => {
+            let action_opt = state.borrow_mut().undo_stack.pop();
+            if let Some(act) = action_opt {
+                let state = state.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    match operations::undo_action(&act).await {
+                        Ok(msg) => {
+                            state.borrow_mut().redo_stack.push(act);
+                            render(&state);
+                            set_status(&state, &msg);
+                        }
+                        Err(err) => {
+                            set_status(&state, &format!("Undo failed: {err}"));
+                        }
+                    }
+                });
+            } else {
+                set_status(state, "Nothing to undo.");
+            }
+        }
+        FileAction::Redo => {
+            let action_opt = state.borrow_mut().redo_stack.pop();
+            if let Some(act) = action_opt {
+                let state = state.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    match operations::redo_action(&act).await {
+                        Ok(msg) => {
+                            state.borrow_mut().undo_stack.push(act);
+                            render(&state);
+                            set_status(&state, &msg);
+                        }
+                        Err(err) => {
+                            set_status(&state, &format!("Redo failed: {err}"));
+                        }
+                    }
+                });
+            } else {
+                set_status(state, "Nothing to redo.");
+            }
+        }
         FileAction::Properties => show_properties(parent, state),
     }
 }
@@ -940,6 +1339,11 @@ fn create_file_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>)
                     {
                         Ok(stream) => match stream.close_future(glib::Priority::DEFAULT).await {
                             Ok(()) => {
+                                {
+                                    let mut s = state.borrow_mut();
+                                    s.redo_stack.clear();
+                                    s.undo_stack.push(operations::UndoAction::Create { file: file.clone() });
+                                }
                                 render(&state);
                                 set_status(&state, &format!("Created {file_name}"));
                             }
@@ -1056,7 +1460,22 @@ fn transfer_items(
                 operations::copy(source, &target).await
             };
             match result {
-                Ok(()) => transferred += 1,
+                Ok(()) => {
+                    transferred += 1;
+                    let action = if is_cut {
+                        operations::UndoAction::Move {
+                            source: source.clone(),
+                            destination: target.clone(),
+                        }
+                    } else {
+                        operations::UndoAction::Copy {
+                            destination: target.clone(),
+                        }
+                    };
+                    let mut s = state.borrow_mut();
+                    s.redo_stack.clear();
+                    s.undo_stack.push(action);
+                }
                 Err(error) => set_status(&state, &format!("Could not transfer {name}: {error}")),
             }
         }
@@ -1137,7 +1556,15 @@ fn rename_selected(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
             let state = state.clone();
             glib::MainContext::default().spawn_local(async move {
                 match operations::rename(&file, &new_name).await {
-                    Ok(_) => {
+                    Ok(new_file) => {
+                        {
+                            let mut s = state.borrow_mut();
+                            s.redo_stack.clear();
+                            s.undo_stack.push(operations::UndoAction::Rename {
+                                old_file: file.clone(),
+                                new_file,
+                            });
+                        }
                         render(&state);
                         set_status(&state, &format!("Renamed to {new_name}"));
                     }
@@ -1195,13 +1622,26 @@ fn remove_items(state: &Rc<RefCell<AppState>>, items: Vec<FileRowData>, permanen
     glib::MainContext::default().spawn_local(async move {
         let mut removed = 0usize;
         for item in &items {
+            let original_path = (!permanent).then(|| item.file.path()).flatten();
             let result = if permanent {
                 operations::delete(&item.file).await
             } else {
                 operations::trash(&item.file).await
             };
             match result {
-                Ok(()) => removed += 1,
+                Ok(()) => {
+                    removed += 1;
+                    if let Some(original_path) = original_path {
+                        if let Some(trash_file) = operations::find_in_trash(&original_path).await {
+                            let mut state = state.borrow_mut();
+                            state.redo_stack.clear();
+                            state.undo_stack.push(operations::UndoAction::Trash {
+                                original_path,
+                                trash_file,
+                            });
+                        }
+                    }
+                }
                 Err(error) => set_status(&state, &format!("Could not remove item: {error}")),
             }
         }
@@ -1215,11 +1655,35 @@ fn remove_items(state: &Rc<RefCell<AppState>>, items: Vec<FileRowData>, permanen
 
 fn show_properties(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
     let selected = selected_files(state);
-    if selected.len() != 1 {
+    let (item, is_dir) = if selected.is_empty() {
+        let current_file = state.borrow().current.clone();
+        match current_file.query_info(
+            "standard::*,unix::*,time::*",
+            gio::FileQueryInfoFlags::NONE,
+            None::<&gio::Cancellable>,
+        ) {
+            Ok(info) => (
+                FileRowData {
+                    file: current_file,
+                    is_dir: true,
+                    info,
+                },
+                true,
+            ),
+            Err(e) => {
+                set_status(state, &format!("Cannot query properties: {e}"));
+                return;
+            }
+        }
+    } else if selected.len() == 1 {
+        let item = selected[0].clone();
+        let is_dir = item.is_dir;
+        (item, is_dir)
+    } else {
         set_status(state, "Select one item to view its properties.");
         return;
-    }
-    let item = selected[0].clone();
+    };
+
     let dialog = gtk::Dialog::builder()
         .title("Properties")
         .transient_for(parent)
@@ -1232,25 +1696,68 @@ fn show_properties(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
     panel.set_margin_bottom(18);
     panel.set_margin_start(18);
     panel.set_margin_end(18);
-    let title = Label::new(Some(&item.info.display_name()));
+
+    let display_name = item.info.display_name().to_string();
+    let title = Label::new(Some(&display_name));
     title.set_xalign(0.0);
     title.add_css_class("brand-title");
-    let size = if item.is_dir {
-        "Directory size is not calculated".to_string()
-    } else {
-        format!("{} bytes", item.info.size().max(0))
-    };
-    let details = Label::new(Some(&format!(
-        "{}\n{}\n{}",
-        if item.is_dir { "Folder" } else { "File" },
-        filesystem::display_location(&item.file),
-        size
-    )));
+
+    let kind_str = filesystem::file_type_description(&item.info, is_dir, &display_name);
+    let loc_str = filesystem::display_location(&item.file);
+    let mod_str = item
+        .info
+        .modification_date_time()
+        .and_then(|dt| dt.format("%Y-%m-%d %H:%M:%S").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let mut details_text = format!("Type: {kind_str}\nLocation: {loc_str}\nModified: {mod_str}");
+    if item.info.is_symlink() {
+        if let Some(target) = item.info.symlink_target() {
+            details_text.push_str(&format!("\nTarget: {}", target.display()));
+        }
+    }
+
+    let details = Label::new(Some(&details_text));
     details.set_xalign(0.0);
     details.set_selectable(true);
     details.add_css_class("dim-label");
+
+    let size_label = if is_dir {
+        let lbl = Label::new(Some("Size: Calculating…"));
+        lbl.set_xalign(0.0);
+        let lbl_clone = lbl.clone();
+        let file_clone = item.file.clone();
+        glib::MainContext::default().spawn_local(async move {
+            match operations::calculate_dir_size(&file_clone).await {
+                Ok((bytes, items)) => {
+                    lbl_clone.set_text(&format!(
+                        "Size: {} ({} bytes, {} items)",
+                        filesystem::format_size(bytes),
+                        bytes,
+                        items
+                    ));
+                }
+                Err(_) => {
+                    lbl_clone.set_text("Size: Unable to calculate");
+                }
+            }
+        });
+        lbl
+    } else {
+        let bytes = item.info.size().max(0) as u64;
+        let lbl = Label::new(Some(&format!(
+            "Size: {} ({} bytes)",
+            filesystem::format_size(bytes),
+            bytes
+        )));
+        lbl.set_xalign(0.0);
+        lbl
+    };
+
     panel.append(&title);
     panel.append(&details);
+    panel.append(&size_label);
     let permissions_title = Label::new(Some("UNIX PERMISSIONS"));
     permissions_title.set_xalign(0.0);
     permissions_title.add_css_class("section-label");
@@ -1282,9 +1789,13 @@ fn show_properties(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
         }
     }
     panel.append(&grid);
+    let recursive = CheckButton::with_label("Apply to contained files and folders");
+    recursive.set_visible(is_dir);
+    panel.append(&recursive);
     dialog.content_area().append(&panel);
     let state = state.clone();
     let file = item.file.clone();
+    let recursive_mode = recursive.clone();
     let file_type_bits = original_mode & !0o7777;
     dialog.connect_response(move |dialog, response| {
         if response == gtk::ResponseType::Accept {
@@ -1300,6 +1811,19 @@ fn show_properties(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
                 gio::FileQueryInfoFlags::NONE,
                 None::<&gio::Cancellable>,
             ) {
+                Ok(()) if recursive_mode.is_active() => {
+                    let state = state.clone();
+                    let file = file.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        match operations::set_mode_recursive(&file, new_mode).await {
+                            Ok(()) => {
+                                render(&state);
+                                set_status(&state, "Permissions updated for folder contents.");
+                            }
+                            Err(error) => set_status(&state, &format!("Could not update folder contents: {error}")),
+                        }
+                    });
+                }
                 Ok(()) => {
                     render(&state);
                     set_status(&state, "Permissions updated.");
@@ -1339,17 +1863,172 @@ fn tab_header(name: &str) -> (GtkBox, Label, Button) {
     (header, title, close)
 }
 
+fn update_status_bar(state: &Rc<RefCell<AppState>>) {
+    let s = state.borrow();
+    let Some(rows) = &s.rows else { return };
+    let Some(status) = &s.status_label else { return };
+    let selected = rows.selected_rows();
+    if selected.is_empty() {
+        let mut total = 0;
+        let mut child = rows.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if let Ok(row) = widget.downcast::<ListBoxRow>() {
+                if row.is_selectable() {
+                    total += 1;
+                }
+            }
+        }
+        let folder = s.current.clone();
+        let status = status.clone();
+        let query_empty = s.query.is_empty();
+        drop(s);
+
+        glib::MainContext::default().spawn_local(async move {
+            let free_space = if folder.is_native() {
+                folder
+                    .query_filesystem_info_future(
+                        "filesystem::free",
+                        glib::Priority::DEFAULT,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|info| {
+                        let free = info.attribute_uint64("filesystem::free");
+                        if free > 0 {
+                            Some(format!("  ·  {} available", filesystem::format_size(free)))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let prefix = if query_empty {
+                format!("{total} items")
+            } else {
+                format!("{total} matching items")
+            };
+            status.set_text(&format!("{prefix}{free_space}"));
+        });
+    } else {
+        let mut total_size = 0u64;
+        let mut file_count = 0;
+        let mut dir_count = 0;
+        for row in selected {
+            if let Some(item) = row_path(&row) {
+                if item.is_dir {
+                    dir_count += 1;
+                } else {
+                    file_count += 1;
+                    total_size += item.info.size().max(0) as u64;
+                }
+            }
+        }
+        let msg = match (dir_count, file_count) {
+            (1, 0) => "1 folder selected".to_string(),
+            (d, 0) => format!("{d} folders selected"),
+            (0, 1) => format!("1 item selected ({})", filesystem::format_size(total_size)),
+            (0, f) => format!("{f} items selected ({})", filesystem::format_size(total_size)),
+            (d, f) => format!("{d} folders, {f} items selected ({})", filesystem::format_size(total_size)),
+        };
+        status.set_text(&msg);
+    }
+}
+
 fn connect_file_rows(rows: &ListBox, state: &Rc<RefCell<AppState>>) {
-    let state = state.clone();
+    let state_activate = state.clone();
     rows.connect_row_activated(move |_, row| {
         if let Some(item) = row_path(row) {
             if item.is_dir {
-                navigate_to(&state, item.file, true);
+                navigate_to(&state_activate, item.file, true);
             } else if let Err(error) = filesystem::open_file(&item.file) {
-                set_status(&state, &format!("Could not open file: {error}"));
+                set_status(&state_activate, &format!("Could not open file: {error}"));
             }
         }
     });
+    let state_select = state.clone();
+    rows.connect_selected_rows_changed(move |_| {
+        update_status_bar(&state_select);
+    });
+}
+
+fn connect_background_context_menu(
+    rows: &ListBox,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let popover = Popover::new();
+    popover.set_parent(rows);
+    popover.set_has_arrow(false);
+    let menu = GtkBox::new(Orientation::Vertical, 2);
+    menu.set_margin_top(5);
+    menu.set_margin_bottom(5);
+    menu.set_margin_start(5);
+    menu.set_margin_end(5);
+
+    let popover_weak = popover.downgrade();
+    let gesture = GestureClick::new();
+    gesture.set_button(3);
+    let rows_clone = rows.clone();
+    let st = state.clone();
+    let menu_clone = menu.clone();
+
+    gesture.connect_pressed(move |_, _, x, y| {
+        let hit_selectable_row = rows_clone
+            .row_at_y(y as i32)
+            .map(|r| r.is_selectable())
+            .unwrap_or(false);
+
+        if !hit_selectable_row {
+            rows_clone.unselect_all();
+            if let Some(popover) = popover_weak.upgrade() {
+                while let Some(child) = menu_clone.first_child() {
+                    menu_clone.remove(&child);
+                }
+
+                let is_trash = st.borrow().current.uri() == "trash:///";
+                let has_clipboard = !st.borrow().clipboard.is_empty();
+
+                let mut items: Vec<(&str, &str, FileAction)> = Vec::new();
+                if is_trash {
+                    items.push(("Empty Trash…", "user-trash-symbolic", FileAction::EmptyTrash));
+                    items.push(("Properties", "dialog-information-symbolic", FileAction::Properties));
+                } else {
+                    items.push(("New Folder…", "folder-new-symbolic", FileAction::NewFolder));
+                    items.push(("New Empty File…", "document-new-symbolic", FileAction::NewFile));
+                    if has_clipboard {
+                        items.push(("Paste", "edit-paste-symbolic", FileAction::Paste));
+                    }
+                    items.push(("Select All", "edit-select-all-symbolic", FileAction::SelectAll));
+                    items.push(("Open in Terminal", "utilities-terminal-symbolic", FileAction::OpenTerminalHere));
+                    items.push(("Properties", "dialog-information-symbolic", FileAction::Properties));
+                }
+
+                for (label, icon, act) in items {
+                    let btn = menu_action_button(icon, label);
+                    btn.add_css_class("flat");
+                    let p_weak = popover_weak.clone();
+                    let st_c = st.clone();
+                    btn.connect_clicked(move |_| {
+                        if let Some(p) = p_weak.upgrade() {
+                            p.popdown();
+                        }
+                        if let Some(parent) = st_c.borrow().mount_parent.clone() {
+                            perform_file_action(act, &parent, &st_c);
+                        }
+                    });
+                    menu_clone.append(&btn);
+                }
+
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            }
+        }
+    });
+
+    popover.set_child(Some(&menu));
+    rows.add_controller(gesture);
 }
 
 fn connect_row_context_menu(row: &ListBoxRow, state: &Rc<RefCell<AppState>>) {
@@ -1362,45 +2041,46 @@ fn connect_row_context_menu(row: &ListBoxRow, state: &Rc<RefCell<AppState>>) {
     menu.set_margin_start(5);
     menu.set_margin_end(5);
 
-    let mut actions = vec![("Open", "document-open-symbolic", FileAction::Open)];
-    if row_path(row).is_some_and(|item| item.is_dir) {
-        actions.push((
-            "Open in New Tab",
-            "tab-new-symbolic",
-            FileAction::OpenInNewTab,
-        ));
-        actions.push((
-            "Open in Terminal Here",
-            "utilities-terminal-symbolic",
-            FileAction::OpenTerminalHere,
-        ));
+    let item_opt = row_path(row);
+    let is_dir = item_opt.as_ref().map(|item| item.is_dir).unwrap_or(false);
+    let name = item_opt
+        .as_ref()
+        .map(|item| item.info.display_name().to_string())
+        .unwrap_or_default();
+    let is_trash = state.borrow().current.uri() == "trash:///";
+
+    let mut actions = Vec::new();
+    if is_trash {
+        actions.push(("Restore from Trash", "edit-undo-symbolic", FileAction::RestoreFromTrash));
+        actions.push(("Delete Permanently…", "edit-delete-symbolic", FileAction::Delete));
+        actions.push(("Properties", "dialog-information-symbolic", FileAction::Properties));
+    } else {
+        actions.push(("Open", "document-open-symbolic", FileAction::Open));
+        if is_dir {
+            actions.push(("Open in New Tab", "tab-new-symbolic", FileAction::OpenInNewTab));
+            actions.push(("Open in Terminal Here", "utilities-terminal-symbolic", FileAction::OpenTerminalHere));
+        } else {
+            actions.push(("Open with Text Editor", "accessories-text-editor-symbolic", FileAction::OpenWithEditor));
+        }
+        if filesystem::is_archive(&name) {
+            actions.push(("Extract Here", "package-x-generic-symbolic", FileAction::ExtractHere));
+            actions.push(("Extract to Folder", "folder-new-symbolic", FileAction::ExtractTo));
+        }
+        actions.push(("Copy", "edit-copy-symbolic", FileAction::Copy));
+        actions.push(("Copy Location", "edit-copy-symbolic", FileAction::CopyLocation));
+        actions.push(("Cut", "edit-cut-symbolic", FileAction::Cut));
+        actions.push(("Duplicate", "edit-copy-symbolic", FileAction::Duplicate));
+        actions.push(("Compress to .zip", "package-x-generic-symbolic", FileAction::CompressZip));
+        actions.push(("Compress to .tar.gz", "package-x-generic-symbolic", FileAction::CompressTarGz));
+        actions.push(("Rename…", "document-edit-symbolic", FileAction::Rename));
+        actions.push(("Move to Trash", "user-trash-symbolic", FileAction::Trash));
+        actions.push(("Delete Permanently…", "edit-delete-symbolic", FileAction::Delete));
+        actions.push(("Properties", "dialog-information-symbolic", FileAction::Properties));
     }
-    actions.extend([
-        ("Copy", "edit-copy-symbolic", FileAction::Copy),
-        (
-            "Copy Location",
-            "edit-copy-symbolic",
-            FileAction::CopyLocation,
-        ),
-        ("Cut", "edit-cut-symbolic", FileAction::Cut),
-        ("Rename…", "document-edit-symbolic", FileAction::Rename),
-        ("Move to Trash", "user-trash-symbolic", FileAction::Trash),
-        (
-            "Delete Permanently…",
-            "edit-delete-symbolic",
-            FileAction::Delete,
-        ),
-        (
-            "Properties",
-            "dialog-information-symbolic",
-            FileAction::Properties,
-        ),
-    ]);
 
     let popover_weak = popover.downgrade();
     for (label, icon, action) in actions {
-        let button = Button::with_label(label);
-        button.set_icon_name(icon);
+        let button = menu_action_button(icon, label);
         button.add_css_class("flat");
         let state = state.clone();
         let popover = popover_weak.clone();
@@ -1415,10 +2095,14 @@ fn connect_row_context_menu(row: &ListBoxRow, state: &Rc<RefCell<AppState>>) {
                     | FileAction::Properties
                     | FileAction::OpenInNewTab
                     | FileAction::OpenTerminalHere
+                    | FileAction::ExtractHere
+                    | FileAction::ExtractTo
             ) {
                 if let Some(rows) = state.borrow().rows.clone() {
-                    rows.unselect_all();
-                    rows.select_row(Some(&row));
+                    if !row.is_selected() {
+                        rows.unselect_all();
+                        rows.select_row(Some(&row));
+                    }
                 }
             }
             let parent = { state.borrow().mount_parent.clone() };
@@ -1497,6 +2181,47 @@ fn switch_tab(state: &Rc<RefCell<AppState>>, _notebook: &Notebook, index: usize)
     render(state);
 }
 
+fn connect_to_server_dialog(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
+    let dialog = gtk::Dialog::builder()
+        .title("Connect to Server")
+        .transient_for(parent)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+    dialog.add_button("Connect", gtk::ResponseType::Accept);
+    let form = GtkBox::new(Orientation::Vertical, 8);
+    form.set_margin_top(16);
+    form.set_margin_bottom(16);
+    form.set_margin_start(16);
+    form.set_margin_end(16);
+    let help = Label::new(Some("Enter a server address such as smb://server/share, sftp://host/path, ftp://host/path, or dav://host/path."));
+    help.set_wrap(true);
+    help.set_xalign(0.0);
+    let address = Entry::new();
+    address.set_placeholder_text(Some("smb://server/share"));
+    address.set_hexpand(true);
+    form.append(&help);
+    form.append(&address);
+    dialog.content_area().append(&form);
+    let address_input = address.clone();
+    let state = state.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept {
+            let uri = address_input.text().trim().to_string();
+            let scheme = uri.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase());
+            match scheme.as_deref() {
+                Some("smb" | "ftp" | "ftps" | "sftp" | "dav" | "davs") => {
+                    navigate_to(&state, gio::File::for_uri(&uri), true);
+                }
+                _ => set_status(&state, "Enter a server URI using smb, ftp, ftps, sftp, dav, or davs."),
+            }
+        }
+        dialog.close();
+    });
+    dialog.present();
+    address.grab_focus();
+}
+
 fn new_tab(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
     let (notebook, location, query, single_click) = {
         let s = state.borrow();
@@ -1514,6 +2239,7 @@ fn new_tab(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
     rows.set_selection_mode(gtk::SelectionMode::Multiple);
     rows.add_css_class("file-list");
     rows.set_activate_on_single_click(single_click);
+    rows.set_vexpand(true);
     let scroll = ScrolledWindow::new();
     scroll.set_hexpand(true);
     scroll.set_vexpand(true);
@@ -1534,6 +2260,7 @@ fn new_tab(parent: &ApplicationWindow, state: &Rc<RefCell<AppState>>) {
         title,
     });
     connect_file_rows(&rows, state);
+    connect_background_context_menu(&rows, state);
     let state_close = state.clone();
     let notebook_close = notebook.clone();
     let scroll_close = scroll.clone();
@@ -1640,6 +2367,142 @@ fn place_row(icon: &str, name: &str) -> Button {
     row.add_css_class("flat");
     row.add_css_class("place-button");
     row
+}
+
+fn menu_action_button(icon: &str, label: &str) -> Button {
+    let button = Button::new();
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.set_margin_top(5);
+    content.set_margin_bottom(5);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
+    let image = Image::from_icon_name(icon);
+    image.set_pixel_size(16);
+    image.set_halign(gtk::Align::Start);
+    let text = Label::new(Some(label));
+    text.set_xalign(0.0);
+    content.append(&image);
+    content.append(&text);
+    button.set_child(Some(&content));
+    button.set_halign(gtk::Align::Fill);
+    button.set_hexpand(true);
+    button
+}
+
+fn connect_place_context_menu(
+    row: &Button,
+    location: gio::File,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let popover = Popover::new();
+    popover.set_parent(row);
+    let menu = GtkBox::new(Orientation::Vertical, 2);
+    menu.set_margin_top(5);
+    menu.set_margin_bottom(5);
+    menu.set_margin_start(5);
+    menu.set_margin_end(5);
+    let open = menu_action_button("tab-new-symbolic", "Open in New Tab");
+    open.add_css_class("flat");
+    let target = location.clone();
+    let state_open = state.clone();
+    let popover_weak = popover.downgrade();
+    open.connect_clicked(move |_| {
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.popdown();
+        }
+        if let Some(parent) = state_open.borrow().mount_parent.clone() {
+            new_tab(&parent, &state_open);
+            navigate_to(&state_open, target.clone(), false);
+        }
+    });
+    menu.append(&open);
+    popover.set_child(Some(&menu));
+
+    let context = GestureClick::new();
+    context.set_button(3);
+    let popover_weak = popover.downgrade();
+    context.connect_pressed(move |_, _, x, y| {
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    });
+    row.add_controller(context);
+
+    let middle = GestureClick::new();
+    middle.set_button(2);
+    let target = location;
+    let state = state.clone();
+    middle.connect_pressed(move |_, _, _, _| {
+        if let Some(parent) = state.borrow().mount_parent.clone() {
+            new_tab(&parent, &state);
+            navigate_to(&state, target.clone(), false);
+        }
+    });
+    row.add_controller(middle);
+}
+
+fn connect_trash_place_menu(
+    row: &Button,
+    parent: &ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+) {
+    let popover = Popover::new();
+    popover.set_parent(row);
+    popover.set_has_arrow(true);
+    let actions = GtkBox::new(Orientation::Vertical, 2);
+    actions.set_margin_top(5);
+    actions.set_margin_bottom(5);
+    actions.set_margin_start(5);
+    actions.set_margin_end(5);
+    let open = menu_action_button("tab-new-symbolic", "Open in New Tab");
+    open.add_css_class("flat");
+    let state_open = state.clone();
+    let popover_open = popover.downgrade();
+    open.connect_clicked(move |_| {
+        if let Some(popover) = popover_open.upgrade() {
+            popover.popdown();
+        }
+        if let Some(parent) = state_open.borrow().mount_parent.clone() {
+            new_tab(&parent, &state_open);
+            navigate_to(&state_open, gio::File::for_uri("trash:///"), false);
+        }
+    });
+    actions.append(&open);
+    let empty = menu_action_button("user-trash-symbolic", "Empty Trash…");
+    empty.add_css_class("flat");
+    let popover_weak = popover.downgrade();
+    let state_empty = state.clone();
+    let parent = parent.clone();
+    empty.connect_clicked(move |_| {
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.popdown();
+        }
+        perform_file_action(FileAction::EmptyTrash, &parent, &state_empty);
+    });
+    actions.append(&empty);
+    popover.set_child(Some(&actions));
+    let gesture = GestureClick::new();
+    gesture.set_button(3);
+    let popover_weak = popover.downgrade();
+    gesture.connect_pressed(move |_, _, x, y| {
+        if let Some(popover) = popover_weak.upgrade() {
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    });
+    row.add_controller(gesture);
+
+    let middle = GestureClick::new();
+    middle.set_button(2);
+    let state_middle = state.clone();
+    middle.connect_pressed(move |_, _, _, _| {
+        if let Some(parent) = state_middle.borrow().mount_parent.clone() {
+            new_tab(&parent, &state_middle);
+            navigate_to(&state_middle, gio::File::for_uri("trash:///"), false);
+        }
+    });
+    row.add_controller(middle);
 }
 
 fn refresh_devices(state: &Rc<RefCell<AppState>>, parent: &ApplicationWindow) {
@@ -1873,6 +2736,7 @@ fn refresh_bookmarks(state: &Rc<RefCell<AppState>>) {
             .unwrap_or_else(|| filesystem::display_location(&file));
         let row = GtkBox::new(Orientation::Horizontal, 2);
         let open = place_row("user-bookmarks-symbolic", &name);
+        connect_place_context_menu(&open, file.clone(), state);
         let state_open = state.clone();
         let file_to_open = file.clone();
         open.connect_clicked(move |_| navigate_to(&state_open, file_to_open.clone(), true));
@@ -2005,8 +2869,12 @@ fn render(state: &Rc<RefCell<AppState>>) {
     let Some(rows) = rows else {
         return;
     };
-    while let Some(child) = rows.first_child() {
-        rows.remove(&child);
+    let mut child = rows.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(row) = widget.downcast::<ListBoxRow>() {
+            rows.remove(&row);
+        }
     }
     if let Some(entry) = location {
         entry.set_text(&filesystem::display_location(&folder));
@@ -2043,7 +2911,7 @@ fn render(state: &Rc<RefCell<AppState>>) {
     }
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
-        const ATTRIBUTES: &str = "standard::name,standard::display-name,standard::type,standard::size,standard::is-symlink,standard::is-hidden,unix::mode,time::modified";
+        const ATTRIBUTES: &str = "standard::name,standard::display-name,standard::type,standard::size,standard::is-symlink,standard::is-hidden,standard::symlink-target,unix::mode,time::modified";
         if !folder.is_native() {
             let parent = state.borrow().mount_parent.clone();
             let operation = gtk::MountOperation::new(parent.as_ref());
@@ -2109,15 +2977,41 @@ fn render(state: &Rc<RefCell<AppState>>) {
             } else {
                 std::cmp::Ordering::Equal
             };
-            directory_order.then_with(|| match preferences.sort_by {
-                settings::SortBy::Name => a
-                    .display_name()
-                    .to_lowercase()
-                    .cmp(&b.display_name().to_lowercase()),
-                settings::SortBy::Size => a.size().cmp(&b.size()),
-                settings::SortBy::Modified => a
-                    .attribute_uint64("time::modified")
-                    .cmp(&b.attribute_uint64("time::modified")),
+            directory_order.then_with(|| {
+                let ordering = match preferences.sort_by {
+                    settings::SortBy::Name => a
+                        .display_name()
+                        .to_lowercase()
+                        .cmp(&b.display_name().to_lowercase()),
+                    settings::SortBy::Size => a.size().cmp(&b.size()),
+                    settings::SortBy::Modified => a
+                        .attribute_uint64("time::modified")
+                        .cmp(&b.attribute_uint64("time::modified")),
+                    settings::SortBy::Type => {
+                        let ext_a = a
+                            .name()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        let ext_b = b
+                            .name()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        ext_a.cmp(&ext_b).then_with(|| {
+                            a.display_name()
+                                .to_lowercase()
+                                .cmp(&b.display_name().to_lowercase())
+                        })
+                    }
+                };
+                if preferences.sort_reversed {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
             })
         });
         if !preferences.show_hidden {
@@ -2139,13 +3033,31 @@ fn render(state: &Rc<RefCell<AppState>>) {
             };
             let row = ListBoxRow::new();
             row.add_css_class("file-row");
+            if preferences.compact_view {
+                row.add_css_class("compact-row");
+            }
             let line = GtkBox::new(Orientation::Horizontal, 12);
-            line.set_margin_top(8);
-            line.set_margin_bottom(8);
+            let vertical_margin = if preferences.compact_view { 3 } else { 8 };
+            line.set_margin_top(vertical_margin);
+            line.set_margin_bottom(vertical_margin);
             line.set_margin_start(14);
             line.set_margin_end(14);
-            let image = Image::from_icon_name(icon);
-            image.set_pixel_size(22);
+            let image: gtk::Widget = if preferences.show_thumbnails
+                && !is_dir
+                && filesystem::is_image(&name)
+            {
+                let picture = gtk::Picture::for_file(&file);
+                picture.set_can_shrink(true);
+                picture.set_keep_aspect_ratio(true);
+                let thumbnail_size = if preferences.compact_view { 30 } else { 44 };
+                picture.set_size_request(thumbnail_size, thumbnail_size);
+                picture.add_css_class("file-thumbnail");
+                picture.upcast()
+            } else {
+                let image = Image::from_icon_name(icon);
+                image.set_pixel_size(if preferences.compact_view { 18 } else { 22 });
+                image.upcast()
+            };
             let text = GtkBox::new(Orientation::Vertical, 2);
             text.set_hexpand(true);
             let title = Label::new(Some(&name));
@@ -2211,12 +3123,17 @@ fn render(state: &Rc<RefCell<AppState>>) {
             };
             status.set_text(&shown_text);
         }
+        update_status_bar(&state);
     });
 }
 
 fn show_listing_error(rows: &ListBox, status: Option<&Label>, message: &str) {
-    while let Some(child) = rows.first_child() {
-        rows.remove(&child);
+    let mut child = rows.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(row) = widget.downcast::<ListBoxRow>() {
+            rows.remove(&row);
+        }
     }
     let row = ListBoxRow::new();
     row.set_selectable(false);
@@ -2235,21 +3152,24 @@ fn show_listing_error(rows: &ListBox, status: Option<&Label>, message: &str) {
 fn install_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data("\
+        .app-shell { background-color: alpha(@theme_bg_color, 0.94); border: 1px solid alpha(@theme_fg_color, 0.13); border-radius: 22px; }\
+        .workspace-pane { border-radius: 20px; }\
         .brand-title { font-size: 1.08em; font-weight: 700; letter-spacing: 0.01em; }\
-        .sidebar-panel { background-color: @theme_bg_color; border-right: 1px solid alpha(@theme_fg_color, 0.10); }\
+        .sidebar-panel { background-color: alpha(@theme_bg_color, 0.76); border-right: 1px solid alpha(@theme_fg_color, 0.12); border-top-left-radius: 20px; border-bottom-left-radius: 20px; }\
         .section-label { font-size: 0.72em; font-weight: 750; letter-spacing: 0.10em; opacity: 0.68; padding: 5px 10px; }\
-        .place-button { border-radius: 8px; }\
-        .place-button:hover { background: alpha(@theme_selected_bg_color, 0.10); }\
-        .address-toolbar { padding-top: 3px; padding-bottom: 3px; }\
+        .place-button { border-radius: 12px; min-height: 36px; }\
+        .place-button:hover { background: alpha(@theme_selected_bg_color, 0.12); }\
+        .address-toolbar { padding: 7px 10px; margin: 10px 12px 6px; border-radius: 16px; background: alpha(@theme_fg_color, 0.035); border: 1px solid alpha(@theme_fg_color, 0.07); }\
         .location-entry { font-weight: 550; min-width: 140px; }\
-        .file-list { padding: 8px 4px; }\
-        .file-row { border-radius: 10px; border-bottom: 1px solid alpha(@theme_fg_color, 0.055); margin: 1px 8px; }\
-        .file-row:hover { background: alpha(@theme_selected_bg_color, 0.10); }\
-        .file-list row:selected { background: alpha(@theme_selected_bg_color, 0.22); }\
+        .file-list { padding: 12px 6px; background: transparent; }\
+        .file-row { border-radius: 13px; border: 1px solid transparent; margin: 2px 8px; }\
+        .file-row:hover { background: alpha(@theme_selected_bg_color, 0.09); border-color: alpha(@theme_fg_color, 0.08); }\
+        .file-list row:selected { background: alpha(@theme_selected_bg_color, 0.20); border-color: alpha(@theme_selected_bg_color, 0.32); }\
+        .file-thumbnail { border-radius: 9px; }\
         .file-name { font-weight: 550; }\
         .file-cut { opacity: 0.48; }\
         .file-detail { font-size: 0.83em; }\
-        .statusbar { padding: 8px 16px; color: @theme_unfocused_fg_color; font-size: 0.88em; }\
+        .statusbar { padding: 10px 18px; color: @theme_unfocused_fg_color; font-size: 0.88em; }\
         .badge { padding: 3px 8px; border-radius: 999px; background: alpha(@theme_selected_bg_color, 0.18); color: @theme_selected_fg_color; font-size: 0.72em; font-weight: 700; }\
     ");
     if let Some(display) = gdk::Display::default() {
