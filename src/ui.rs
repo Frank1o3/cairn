@@ -1407,12 +1407,33 @@ fn install_css() {
         if !style_path.exists() {
             std::fs::write(&style_path, EMBEDDED_STYLE)?;
         } else {
-            let style = std::fs::read_to_string(&style_path)?;
+            let mut style = std::fs::read_to_string(&style_path)?;
+            let mut migrated = false;
             if !style.contains("@import url(\"definitions.css\")") {
-                std::fs::write(
-                    &style_path,
-                    format!("@import url(\"definitions.css\");\n{style}"),
-                )?;
+                style = format!("@import url(\"definitions.css\");\n{style}");
+                migrated = true;
+            }
+            // Earlier generated styles used translucent surfaces, which let
+            // other windows bleed through. Migrate only these shipped default
+            // values while preserving unrelated user stylesheet edits.
+            let opaque_defaults = [
+                (
+                    "background-color: alpha(@cairn_bg_color, 0.94);",
+                    "background-color: @cairn_bg_color;",
+                ),
+                (
+                    "background-color: alpha(@cairn_bg_color, 0.76);",
+                    "background-color: @cairn_bg_color;",
+                ),
+            ];
+            for (old, new) in opaque_defaults {
+                if style.contains(old) {
+                    style = style.replace(old, new);
+                    migrated = true;
+                }
+            }
+            if migrated {
+                std::fs::write(&style_path, style)?;
             }
         }
         Ok(())

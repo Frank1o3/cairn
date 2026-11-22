@@ -348,6 +348,36 @@ pub(super) fn build_ui(app: &Application) {
     rows.add_css_class("file-list");
     rows.set_activate_on_single_click(false);
     rows.set_vexpand(true);
+    rows.set_tooltip_text(Some("Drop files here to copy or move them into this folder"));
+    let file_drop = gtk::DropTarget::new(
+        gdk::FileList::static_type(),
+        gdk::DragAction::COPY | gdk::DragAction::MOVE,
+    );
+    let drop_rows = rows.clone();
+    file_drop.connect_enter(move |_, _, _| {
+        drop_rows.add_css_class("drop-active");
+        gdk::DragAction::COPY | gdk::DragAction::MOVE
+    });
+    let drop_rows = rows.clone();
+    file_drop.connect_leave(move |_| drop_rows.remove_css_class("drop-active"));
+    let drop_state = state.clone();
+    file_drop.connect_drop(move |target, value, _, _| {
+        let Ok(file_list) = value.get::<gdk::FileList>() else {
+            return false;
+        };
+        let files = file_list.files();
+        if files.is_empty() {
+            return false;
+        }
+        let is_cut = target
+            .current_drop()
+            .and_then(|drop| drop.drag())
+            .is_some_and(|drag| drag.selected_action() == gdk::DragAction::MOVE);
+        let destination = drop_state.borrow().current.clone();
+        actions::transfer_items(&drop_state, files, is_cut, destination);
+        true
+    });
+    rows.add_controller(file_drop);
     let scroll = ScrolledWindow::new();
     scroll.set_hexpand(true);
     scroll.set_vexpand(true);

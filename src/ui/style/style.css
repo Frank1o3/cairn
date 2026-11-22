@@ -12,7 +12,7 @@
 @import url("definitions.css");
 
 .app-shell {
-    background-color: alpha(@cairn_bg_color, 0.94);
+    background-color: @cairn_bg_color;
     border: 1px solid alpha(@cairn_fg_color, 0.13);
     border-radius: 22px;
 }
@@ -33,7 +33,7 @@
 
 .sidebar-panel {
     min-width: 168px;
-    background-color: alpha(@cairn_bg_color, 0.76);
+    background-color: alpha(@cairn_fg_color, 0.035);
     border-right: 1px solid alpha(@cairn_fg_color, 0.12);
     border-top-left-radius: 20px;
     border-bottom-left-radius: 20px;
@@ -60,8 +60,8 @@
     padding: 7px 10px;
     margin: 10px 12px 6px;
     border-radius: 16px;
-    background: alpha(@cairn_fg_color, 0.035);
-    border: 1px solid alpha(@cairn_fg_color, 0.07);
+    background: alpha(@cairn_fg_color, 0.055);
+    border: 1px solid alpha(@cairn_fg_color, 0.10);
 }
 
 .location-entry {
@@ -71,7 +71,11 @@
 
 .file-list {
     padding: 12px 6px;
-    background: transparent;
+    background-color: @cairn_bg_color;
+}
+
+.file-list.drop-active {
+    background-color: alpha(@cairn_selected_bg_color, 0.08);
 }
 
 .file-row {
@@ -83,6 +87,11 @@
 .file-row:hover {
     background: alpha(@cairn_selected_bg_color, 0.09);
     border-color: alpha(@cairn_fg_color, 0.08);
+}
+
+.file-row.drop-target {
+    background: alpha(@cairn_selected_bg_color, 0.22);
+    border-color: alpha(@cairn_selected_bg_color, 0.55);
 }
 
 .file-list row:selected {
@@ -107,7 +116,7 @@
 }
 
 .statusbar {
-    padding: 10px 18px;
+    padding: 8px 18px;
     color: @cairn_unfocused_fg_color;
     font-size: 0.88em;
 }

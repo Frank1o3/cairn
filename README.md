@@ -24,6 +24,7 @@ Cairn is a Rust and GTK4 file manager started with Linux desktop workflows in mi
 - Status bar displays real-time disk free space when idle, and selected item counts and sizes when items are selected.
 - Select files by wildcard pattern with **Ctrl+S** (for example, `*.rs`) or invert the current selection with **Ctrl+Shift+A**.
 - Share copy and cut data through GTK's URI-list and GNOME file clipboard formats for interoperability with other desktop apps.
+- Drop files from compatible desktop apps into the current folder to copy or move them using the drag source's selected action.
 - Open files with the desktop's default application or installed text editors.
 - Create empty files and folders, inspect detailed file properties (including async folder size calculations, full modification timestamps, and symlink targets), and sort by name, size, modified date, or file type (ascending or descending).
 - Customize system or dark appearance, comfortable or compact list density, hidden files, folder ordering, sort mode and direction, thumbnails, single-click activation, and Trash confirmations; preferences, window size, sidebar width, and maximized state persist between sessions.
@@ -36,7 +37,7 @@ Cairn is a Rust and GTK4 file manager started with Linux desktop workflows in mi
 
 ## Build and run
 
-Install Rust and the GTK4 development files for your distribution, then run:
+Install Rust and GTK 4.8 or newer development files for your distribution, then run:
 
 ```sh
 cargo run

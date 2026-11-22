@@ -623,7 +623,7 @@ fn paste_external_clipboard(state: &Rc<RefCell<AppState>>) {
     });
 }
 
-fn transfer_items(
+pub(super) fn transfer_items(
     state: &Rc<RefCell<AppState>>,
     sources: Vec<gio::File>,
     is_cut: bool,

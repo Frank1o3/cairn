@@ -212,7 +212,7 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>) {
             {
                 let picture = gtk::Picture::new();
                 picture.set_can_shrink(true);
-                picture.set_keep_aspect_ratio(true);
+                picture.set_content_fit(gtk::ContentFit::Contain);
                 let thumbnail_size = if preferences.compact_view { 30 } else { 44 };
                 picture.set_size_request(thumbnail_size, thumbnail_size);
                 picture.add_css_class("file-thumbnail");
@@ -261,6 +261,68 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>) {
             }
             row.set_tooltip_text(Some("Double click to open"));
             connect_row_context_menu(&row, &state);
+            let drag_source = gtk::DragSource::new();
+            drag_source.set_actions(gdk::DragAction::COPY | gdk::DragAction::MOVE);
+            let drag_rows = rows.clone();
+            let drag_row = row.clone();
+            drag_source.connect_prepare(move |_, _, _| {
+                let selected = drag_rows.selected_rows();
+                let files: Vec<_> = if selected.iter().any(|item| item == &drag_row) {
+                    selected
+                        .iter()
+                        .filter_map(super::row_path)
+                        .map(|item| item.file)
+                        .collect()
+                } else {
+                    super::row_path(&drag_row)
+                        .map(|item| vec![item.file])
+                        .unwrap_or_default()
+                };
+                if files.is_empty() {
+                    return None;
+                }
+                let value = gdk::FileList::from_array(&files).to_value();
+                Some(gdk::ContentProvider::for_value(&value))
+            });
+            row.add_controller(drag_source);
+            if let Some(destination) = super::row_path(&row)
+                .filter(|item| item.is_dir)
+                .map(|item| item.file)
+            {
+                let drop_target = gtk::DropTarget::new(
+                    gdk::FileList::static_type(),
+                    gdk::DragAction::COPY | gdk::DragAction::MOVE,
+                );
+                let drop_row = row.clone();
+                drop_target.connect_enter(move |_, _, _| {
+                    drop_row.add_css_class("drop-target");
+                    gdk::DragAction::COPY | gdk::DragAction::MOVE
+                });
+                let drop_row = row.clone();
+                drop_target.connect_leave(move |_| drop_row.remove_css_class("drop-target"));
+                let drop_state = state.clone();
+                drop_target.connect_drop(move |target, value, _, _| {
+                    let Ok(file_list) = value.get::<gdk::FileList>() else {
+                        return false;
+                    };
+                    let files = file_list.files();
+                    if files.is_empty() {
+                        return false;
+                    }
+                    let is_cut = target
+                        .current_drop()
+                        .and_then(|drop| drop.drag())
+                        .is_some_and(|drag| drag.selected_action() == gdk::DragAction::MOVE);
+                    super::actions::transfer_items(
+                        &drop_state,
+                        files,
+                        is_cut,
+                        destination.clone(),
+                    );
+                    true
+                });
+                row.add_controller(drop_target);
+            }
             rows.append(&row);
             if let Some((picture, image_file)) = thumbnail {
                 glib::MainContext::default().spawn_local(async move {
