@@ -16,6 +16,7 @@ Cairn is a Rust and GTK4 file manager started with Linux desktop workflows in mi
 - Filter the current folder by name with **Ctrl+F**, with an inline clear button and **Escape** shortcut.
 - Multi-select items and use **Ctrl+C/X/V**, **Ctrl+D** (duplicate), **F2**, **Delete**, and **Shift+Delete** for copy, cut, paste, duplicate, rename, Trash, and permanent deletion.
 - Right-click a file or folder for contextual open, open with text editor, copy, cut, duplicate, rename, Trash, delete, compression, extraction, and Properties actions; folders can also open in a new tab or detached terminal.
+- Right-click an executable file to run it in a terminal as the current user; folders offer **Open in Terminal Here**.
 - Right-click empty space in the file view for quick access to New Folder, New File, Paste, Select All, Open in Terminal, and folder Properties.
 - Archive management: extract `.zip`, `.tar.gz`, `.tar.xz`, `.tar.bz2`, `.tar.zst`, and `.tar` archives with **Extract Here** or **Extract to Folder**, and compress selected items into `.zip` or `.tar.gz` archives.
 - Copy local paths or remote URIs with **Copy Location** in the context menu.
@@ -41,8 +42,23 @@ Install Rust and the GTK4 development files for your distribution, then run:
 cargo run
 ```
 
-The window opens at 1280×820 and keeps a practical 820×560 minimum so it remains usable in a floating layout. Its file pane expands with the window, and the address and search controls release space as the window narrows. The application currently targets Linux. GVFS backends are supplied by the desktop distribution and are not bundled by Cairn.
+The window opens at 1280×820 and keeps a practical 820×560 minimum so it remains usable in a floating layout. Its file pane expands with the window while the places sidebar and toolbar actions keep their selected widths. The application currently targets Linux. GVFS backends are supplied by the desktop distribution and are not bundled by Cairn.
+
+## Developer customization
+
+On first launch Cairn creates its user configuration directory under `$XDG_CONFIG_HOME/cairn` (normally `~/.config/cairn`), including `settings.json`, `style.css`, and `definitions.css`. The previous `settings.ini` is read and migrated when no JSON settings file exists; it is left in place. Cairn also adds the `definitions.css` import to older user stylesheets without replacing their existing rules.
+
+The stylesheet uses GTK CSS and continues to follow the active desktop theme by default. `style.css` imports `definitions.css`, which defines Cairn color tokens from GTK's theme colors. Place palette files next to `style.css` or use an absolute file URL, then restart Cairn to apply changes. A palette template can emit GTK-compatible token definitions; the stylesheet can then reference its colors and override component sizes, for example:
+
+```css
+@import url("wallust-palette.css");
+
+.terminal-button { min-width: 180px; }
+.sidebar-panel { min-width: 200px; }
+```
+
+No Wallust dependency is required.
 
 ## Direction
 
-Cairn is in an ongoing modernization step: improving previews, network browsing, everyday workflows, and a cleaner, softly layered interface while keeping its developer-friendly tools discoverable. Drag and drop and broader image-preview formats remain areas for future improvement.
+Cairn is in an ongoing modernization step: improving previews, network browsing, everyday workflows, and a cleaner, softly layered interface while keeping its developer-friendly tools discoverable. See [ROADMAP.md](ROADMAP.md) for planned diagnostics, previews, search, safety boundaries, and distribution support.

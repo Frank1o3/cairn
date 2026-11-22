@@ -1,0 +1,8 @@
+/* Cairn color tokens map to the active GTK theme by default.
+ * Palette imports can override these names, or users can edit the values here.
+ */
+@define-color cairn_bg_color @theme_bg_color;
+@define-color cairn_fg_color @theme_fg_color;
+@define-color cairn_selected_bg_color @theme_selected_bg_color;
+@define-color cairn_selected_fg_color @theme_selected_fg_color;
+@define-color cairn_unfocused_fg_color @theme_unfocused_fg_color;

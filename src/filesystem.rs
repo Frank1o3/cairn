@@ -1,5 +1,16 @@
 use gtk::gio;
 use gtk::gio::prelude::*;
+
+/// Some GIO backends omit optional attributes even when requested. Reading
+/// `is_symlink()` without the attribute present triggers a GLib critical.
+pub fn is_symlink(info: &gio::FileInfo) -> bool {
+    info.file_type() == gio::FileType::SymbolicLink
+        || (info.has_attribute("standard::is-symlink") && info.is_symlink())
+}
+
+pub fn is_executable(info: &gio::FileInfo) -> bool {
+    info.has_attribute("unix::mode") && info.attribute_uint32("unix::mode") & 0o111 != 0
+}
 use gtk::glib;
 use std::path::Path;
 
@@ -10,7 +21,7 @@ pub fn entry_details(info: &gio::FileInfo, file: &gio::File, is_dir: bool) -> St
     } else {
         parts.push(format_size(info.size().max(0) as u64));
     }
-    if info.is_symlink() {
+    if is_symlink(info) {
         parts.push("Symbolic link".to_string());
     }
     if is_dir {
@@ -80,10 +91,45 @@ pub fn is_archive(name: &str) -> bool {
 pub fn is_text_or_code(name: &str) -> bool {
     let lower = name.to_lowercase();
     [
-        ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".py", ".js", ".mjs", ".ts", ".jsx", ".tsx",
-        ".go", ".java", ".sh", ".bash", ".zsh", ".toml", ".yaml", ".yml", ".json", ".xml",
-        ".html", ".htm", ".css", ".scss", ".md", ".markdown", ".txt", ".conf", ".ini", ".log",
-        ".desktop", ".env", ".diff", ".patch", ".sql", ".lua", ".vim",
+        ".rs",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+        ".cc",
+        ".py",
+        ".js",
+        ".mjs",
+        ".ts",
+        ".jsx",
+        ".tsx",
+        ".go",
+        ".java",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".xml",
+        ".html",
+        ".htm",
+        ".css",
+        ".scss",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".conf",
+        ".ini",
+        ".log",
+        ".desktop",
+        ".env",
+        ".diff",
+        ".patch",
+        ".sql",
+        ".lua",
+        ".vim",
     ]
     .iter()
     .any(|ext| lower.ends_with(ext))
@@ -103,7 +149,7 @@ pub fn file_type_description(info: &gio::FileInfo, is_dir: bool, name: &str) -> 
     if is_dir {
         return "Folder".to_string();
     }
-    if info.is_symlink() {
+    if is_symlink(info) {
         return "Symbolic Link".to_string();
     }
     let lower = name.to_lowercase();
@@ -151,7 +197,11 @@ pub fn icon_for_file(name: &str) -> &'static str {
     if lower.starts_with('.') {
         return "file-hidden-symbolic";
     }
-    if is_archive(name) || [".gz", ".xz", ".7z", ".rar", ".zst"].iter().any(|ext| lower.ends_with(ext)) {
+    if is_archive(name)
+        || [".gz", ".xz", ".7z", ".rar", ".zst"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+    {
         return "package-x-generic-symbolic";
     }
     if is_text_or_code(name) {
@@ -160,7 +210,10 @@ pub fn icon_for_file(name: &str) -> &'static str {
     if is_image(name) {
         return "image-x-generic-symbolic";
     }
-    if [".pdf", ".djvu", ".epub"].iter().any(|ext| lower.ends_with(ext)) {
+    if [".pdf", ".djvu", ".epub"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+    {
         return "x-office-document-symbolic";
     }
     if [".csv", ".tsv", ".ods", ".xlsx", ".xls"]
@@ -190,7 +243,15 @@ pub fn open_file(file: &gio::File) -> Result<(), glib::Error> {
 
 pub fn open_with_text_editor(file: &gio::File) -> Result<(), glib::Error> {
     if let Some(path) = file.path() {
-        let editors = ["gnome-text-editor", "gedit", "kate", "xed", "mousepad", "kwrite", "code"];
+        let editors = [
+            "gnome-text-editor",
+            "gedit",
+            "kate",
+            "xed",
+            "mousepad",
+            "kwrite",
+            "code",
+        ];
         for editor in editors {
             if std::process::Command::new("which")
                 .arg(editor)
@@ -198,7 +259,11 @@ pub fn open_with_text_editor(file: &gio::File) -> Result<(), glib::Error> {
                 .map(|o| o.status.success())
                 .unwrap_or(false)
             {
-                if std::process::Command::new(editor).arg(&path).spawn().is_ok() {
+                if std::process::Command::new(editor)
+                    .arg(&path)
+                    .spawn()
+                    .is_ok()
+                {
                     return Ok(());
                 }
             }

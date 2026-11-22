@@ -1,3 +1,4 @@
+use crate::filesystem;
 use gtk::gio;
 use gtk::gio::prelude::*;
 use gtk::glib;
@@ -22,7 +23,7 @@ fn copy_tree<'a>(
                 glib::Priority::DEFAULT,
             )
             .await?;
-        if info.file_type() != gio::FileType::Directory || info.is_symlink() {
+        if info.file_type() != gio::FileType::Directory || filesystem::is_symlink(&info) {
             let (future, _progress) = source.copy_future(
                 destination,
                 gio::FileCopyFlags::NOFOLLOW_SYMLINKS | gio::FileCopyFlags::ALL_METADATA,
@@ -80,7 +81,7 @@ fn delete_tree(file: &gio::File) -> Pin<Box<dyn Future<Output = Result<(), glib:
                 glib::Priority::DEFAULT,
             )
             .await?;
-        if info.file_type() == gio::FileType::Directory && !info.is_symlink() {
+        if info.file_type() == gio::FileType::Directory && !filesystem::is_symlink(&info) {
             let enumerator = file
                 .enumerate_children_future(
                     "standard::name",
@@ -112,7 +113,10 @@ pub async fn rename(file: &gio::File, new_name: &str) -> Result<gio::File, glib:
 
 pub async fn duplicate(source: &gio::File) -> Result<gio::File, glib::Error> {
     let parent = source.parent().ok_or_else(|| {
-        glib::Error::new(gio::IOErrorEnum::Failed, "No parent directory found for duplication")
+        glib::Error::new(
+            gio::IOErrorEnum::Failed,
+            "No parent directory found for duplication",
+        )
     })?;
     let basename = source
         .basename()
@@ -165,7 +169,7 @@ pub fn calculate_dir_size(
             for child_info in batch {
                 total_items += 1;
                 let child_type = child_info.file_type();
-                let is_symlink = child_info.is_symlink();
+                let is_symlink = filesystem::is_symlink(&child_info);
                 if child_type == gio::FileType::Directory && !is_symlink {
                     let child = enumerator.child(&child_info);
                     if let Ok((sub_bytes, sub_items)) = calculate_dir_size(&child).await {
@@ -190,6 +194,7 @@ pub async fn empty_trash() -> Result<(), glib::Error> {
             glib::Priority::DEFAULT,
         )
         .await?;
+    let mut first_error = None;
     loop {
         let batch = enumerator
             .next_files_future(64, glib::Priority::DEFAULT)
@@ -199,10 +204,14 @@ pub async fn empty_trash() -> Result<(), glib::Error> {
         }
         for item in batch {
             let child = enumerator.child(&item);
-            let _ = delete(&child).await;
+            if let Err(error) = delete(&child).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 pub async fn restore_from_trash(file: &gio::File) -> Result<(), glib::Error> {
@@ -253,10 +262,7 @@ pub async fn find_in_trash(original_path: &std::path::Path) -> Option<gio::File>
     }
 }
 
-pub fn extract_archive(
-    archive_file: &gio::File,
-    destination: &gio::File,
-) -> Result<(), String> {
+pub fn extract_archive(archive_file: &gio::File, destination: &gio::File) -> Result<(), String> {
     let archive_path = archive_file
         .path()
         .ok_or_else(|| "Only local archives can be extracted".to_string())?;
@@ -424,7 +430,7 @@ pub fn set_mode_recursive<'a>(
                 glib::Priority::DEFAULT,
             )
             .await?;
-        if info.file_type() == gio::FileType::Directory && !info.is_symlink() {
+        if info.file_type() == gio::FileType::Directory && !filesystem::is_symlink(&info) {
             let enumerator = file
                 .enumerate_children_future(
                     "standard::name",
@@ -451,17 +457,35 @@ pub fn set_mode_recursive<'a>(
 
 #[derive(Clone, Debug)]
 pub enum UndoAction {
-    Create { file: gio::File },
-    Rename { old_file: gio::File, new_file: gio::File },
-    Move { source: gio::File, destination: gio::File },
-    Copy { destination: gio::File },
-    Trash { original_path: std::path::PathBuf, trash_file: gio::File },
-    Duplicate { copy_file: gio::File },
+    Create {
+        file: gio::File,
+        is_dir: bool,
+    },
+    Rename {
+        old_file: gio::File,
+        new_file: gio::File,
+    },
+    Move {
+        source: gio::File,
+        destination: gio::File,
+    },
+    Copy {
+        source: gio::File,
+        destination: gio::File,
+    },
+    Trash {
+        original_path: std::path::PathBuf,
+        trash_file: gio::File,
+    },
+    Duplicate {
+        source: gio::File,
+        copy_file: gio::File,
+    },
 }
 
 pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
     match action {
-        UndoAction::Create { file } => {
+        UndoAction::Create { file, .. } => {
             delete(file).await?;
             let name = file
                 .basename()
@@ -481,7 +505,10 @@ pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 ))
             }
         }
-        UndoAction::Move { source, destination } => {
+        UndoAction::Move {
+            source,
+            destination,
+        } => {
             move_file(destination, source).await?;
             let name = source
                 .basename()
@@ -489,7 +516,7 @@ pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .unwrap_or_default();
             Ok(format!("Undid move: returned {name}"))
         }
-        UndoAction::Copy { destination } => {
+        UndoAction::Copy { destination, .. } => {
             delete(destination).await?;
             let name = destination
                 .basename()
@@ -497,7 +524,10 @@ pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .unwrap_or_default();
             Ok(format!("Undid copy: removed {name}"))
         }
-        UndoAction::Trash { original_path, trash_file } => {
+        UndoAction::Trash {
+            original_path,
+            trash_file,
+        } => {
             let dest = gio::File::for_path(original_path);
             move_file(trash_file, &dest).await?;
             let name = dest
@@ -506,7 +536,7 @@ pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .unwrap_or_default();
             Ok(format!("Undid trash: restored {name}"))
         }
-        UndoAction::Duplicate { copy_file } => {
+        UndoAction::Duplicate { copy_file, .. } => {
             delete(copy_file).await?;
             let name = copy_file
                 .basename()
@@ -519,12 +549,14 @@ pub async fn undo_action(action: &UndoAction) -> Result<String, glib::Error> {
 
 pub async fn redo_action(action: &UndoAction) -> Result<String, glib::Error> {
     match action {
-        UndoAction::Create { file } => {
-            let res = file.make_directory_future(glib::Priority::DEFAULT).await;
-            if res.is_err() {
-                let _ = file
+        UndoAction::Create { file, is_dir } => {
+            if *is_dir {
+                file.make_directory_future(glib::Priority::DEFAULT).await?;
+            } else {
+                let stream = file
                     .create_future(gio::FileCreateFlags::NONE, glib::Priority::DEFAULT)
-                    .await;
+                    .await?;
+                stream.close_future(glib::Priority::DEFAULT).await?;
             }
             let name = file
                 .basename()
@@ -544,7 +576,10 @@ pub async fn redo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 ))
             }
         }
-        UndoAction::Move { source, destination } => {
+        UndoAction::Move {
+            source,
+            destination,
+        } => {
             move_file(source, destination).await?;
             let name = destination
                 .basename()
@@ -552,7 +587,11 @@ pub async fn redo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .unwrap_or_default();
             Ok(format!("Redid move: {name}"))
         }
-        UndoAction::Copy { destination } => {
+        UndoAction::Copy {
+            source,
+            destination,
+        } => {
+            copy(source, destination).await?;
             let name = destination
                 .basename()
                 .map(|b| b.to_string_lossy().into_owned())
@@ -568,8 +607,13 @@ pub async fn redo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .unwrap_or_default();
             Ok(format!("Redid trash: {name}"))
         }
-        UndoAction::Duplicate { .. } => {
-            Ok("Redo duplicate not applicable".to_string())
+        UndoAction::Duplicate { source, copy_file } => {
+            copy(source, copy_file).await?;
+            let name = copy_file
+                .basename()
+                .map(|b| b.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Ok(format!("Redid duplicate: {name}"))
         }
     }
 }
