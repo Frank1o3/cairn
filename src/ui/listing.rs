@@ -206,21 +206,21 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>) {
             line.set_margin_bottom(vertical_margin);
             line.set_margin_start(14);
             line.set_margin_end(14);
-            let image: gtk::Widget = if preferences.show_thumbnails
+            let (image, thumbnail): (gtk::Widget, Option<(gtk::Picture, gio::File)>) = if preferences.show_thumbnails
                 && !is_dir
                 && filesystem::is_image(&name)
             {
-                let picture = gtk::Picture::for_file(&file);
+                let picture = gtk::Picture::new();
                 picture.set_can_shrink(true);
                 picture.set_keep_aspect_ratio(true);
                 let thumbnail_size = if preferences.compact_view { 30 } else { 44 };
                 picture.set_size_request(thumbnail_size, thumbnail_size);
                 picture.add_css_class("file-thumbnail");
-                picture.upcast()
+                (picture.clone().upcast(), Some((picture, file.clone())))
             } else {
                 let image = Image::from_icon_name(icon);
                 image.set_pixel_size(if preferences.compact_view { 18 } else { 22 });
-                image.upcast()
+                (image.upcast(), None)
             };
             let text = GtkBox::new(Orientation::Vertical, 2);
             text.set_hexpand(true);
@@ -262,6 +262,24 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>) {
             row.set_tooltip_text(Some("Double click to open"));
             connect_row_context_menu(&row, &state);
             rows.append(&row);
+            if let Some((picture, image_file)) = thumbnail {
+                glib::MainContext::default().spawn_local(async move {
+                    let Ok(stream) = image_file
+                        .read_future(glib::Priority::DEFAULT)
+                        .await
+                    else {
+                        return;
+                    };
+                    let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale_future(
+                        &stream, 128, 128, true,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    picture.set_pixbuf(Some(&pixbuf));
+                });
+            }
             shown += 1;
         }
         if shown == 0 {

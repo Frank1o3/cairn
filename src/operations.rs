@@ -8,7 +8,24 @@ use std::pin::Pin;
 const INFO_ATTRIBUTES: &str = "standard::type,standard::is-symlink";
 
 pub async fn copy(source: &gio::File, destination: &gio::File) -> Result<(), glib::Error> {
-    copy_tree(source, destination).await
+    // Only remove a destination on failure when this operation created it.
+    // This avoids leaving half-copied directory trees behind without risking
+    // deletion of a pre-existing destination after a conflict.
+    if destination.query_exists(None::<&gio::Cancellable>) {
+        return Err(glib::Error::new(
+            gio::IOErrorEnum::Exists,
+            "The destination already exists",
+        ));
+    }
+    match copy_tree(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if destination.query_exists(None::<&gio::Cancellable>) {
+                let _ = delete_tree(destination).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 fn copy_tree<'a>(
@@ -224,6 +241,12 @@ pub async fn restore_from_trash(file: &gio::File) -> Result<(), glib::Error> {
         .await?;
     if let Some(orig_path) = info.attribute_byte_string("trash::orig-path") {
         let dest = gio::File::for_path(orig_path.as_str());
+        if dest.query_exists(None::<&gio::Cancellable>) {
+            return Err(glib::Error::new(
+                gio::IOErrorEnum::Exists,
+                "Cannot restore because an item already exists at the original location",
+            ));
+        }
         move_file(file, &dest).await
     } else {
         Err(glib::Error::new(
@@ -596,7 +619,7 @@ pub async fn redo_action(action: &UndoAction) -> Result<String, glib::Error> {
                 .basename()
                 .map(|b| b.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            Ok(format!("Cannot redo copy for {name}"))
+            Ok(format!("Redid copy: {name}"))
         }
         UndoAction::Trash { original_path, .. } => {
             let orig = gio::File::for_path(original_path);
